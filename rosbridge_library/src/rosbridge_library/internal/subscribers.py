@@ -135,7 +135,7 @@ class MultiSubscriber(Generic[ROSMessageT]):
         # - https://github.com/RobotWebTools/rosbridge_suite/issues/551
         # - https://github.com/RobotWebTools/rosbridge_suite/issues/769
         qos = QoSProfile(
-            depth=10,
+            depth=1,
             durability=DurabilityPolicy.VOLATILE,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
