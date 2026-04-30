@@ -36,15 +36,26 @@ from __future__ import annotations
 import fnmatch
 from typing import TYPE_CHECKING, Any
 
+from rosbridge_library.capabilities.advertise import Registration
 from rosbridge_library.capability import Capability
 from rosbridge_library.internal.publishers import manager
+from rosbridge_library.internal.qos_extraction import extract_qos_profile
 
 if TYPE_CHECKING:
+    from rclpy.qos import QoSProfile
+
     from rosbridge_library.protocol import Protocol
 
 
 class Publish(Capability):
-    publish_msg_fields = ((True, "topic", str),)
+    publish_msg_fields = (
+        (True, "topic", str),
+        (False, "type", str),
+        (False, "latch", bool),
+        (False, "queue_size", int),
+        (False, "qos", dict),
+        (False, "msg", dict),
+    )
 
     parameter_names = ("topics_glob",)
 
@@ -57,15 +68,17 @@ class Publish(Capability):
         # Register the operations that this capability provides
         protocol.register_operation("publish", self.publish)
 
-        # Save the topics that are published on for the purposes of unregistering
-        self._published: dict[str, bool] = {}
-
     def publish(self, message: dict[str, Any]) -> None:
         # Do basic type checking
         self.basic_type_check(message, self.publish_msg_fields)
+
+        # Pull out the ID of the advertisement, if it exists
+        adv_id: str | None = message.get("id")
+
         topic: str = message["topic"]
+        msg_type: str | None = message.get("type")
         latch: bool = message.get("latch", False)
-        queue_size: int = message.get("queue_size", 100)
+        queue_size: int | None = message.get("queue_size")
 
         if self.topics_glob is not None:
             self.protocol.log("debug", "Topic security glob enabled, checking topic: " + topic)
@@ -86,32 +99,25 @@ class Publish(Capability):
         else:
             self.protocol.log("debug", "No topic security glob, not checking publish.")
 
-        # Register as a publishing client, propagating any exceptions
         client_id = self.protocol.client_id
-        manager.register(
-            client_id,
-            topic,
-            self.protocol.node_handle,
-            latch=latch,
-            queue_size=queue_size,
-        )
-        self._published[topic] = True
+
+        if topic not in self.protocol.topic_registrations:
+            self.protocol.log(
+                "info",
+                "Trying to publish to unregistered topic: " + topic + ", creating registration...",
+            )
+
+            qos: QoSProfile | None = None
+            if "qos" in message:
+                qos = extract_qos_profile(message["qos"])
+
+            registration = Registration(client_id, topic, self.protocol.node_handle)
+            # Register as a publishing client, propagating any exceptions
+            registration.register_advertisement(msg_type, adv_id, latch, queue_size, qos)
+            self.protocol.topic_registrations[topic] = registration
 
         # Get the message if one was provided
         msg: dict[str, Any] = message.get("msg", {})
 
         # Publish the message
-        manager.publish(
-            client_id,
-            topic,
-            msg,
-            self.protocol.node_handle,
-            latch=latch,
-            queue_size=queue_size,
-        )
-
-    def finish(self) -> None:
-        client_id = self.protocol.client_id
-        for topic in self._published:
-            manager.unregister(client_id, topic)
-        self._published.clear()
+        manager.publish(topic, msg)
