@@ -38,7 +38,7 @@ from threading import Lock, RLock
 from typing import TYPE_CHECKING, Generic, cast
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from rosbridge_library.internal import ros_loader
 from rosbridge_library.internal.message_conversion import msg_class_type_repr
@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 
     from rclpy.node import Node
     from rclpy.subscription import Subscription
+
 
 """ Manages and interfaces with ROS Subscriber objects.  A single subscriber
 is shared between multiple clients
@@ -89,7 +90,7 @@ class MultiSubscriber(Generic[ROSMessageT]):
         :param msg_type: (optional) The type to register the subscriber as.  If not provided, an
             attempt will be made to infer the topic type
         :param qos: (optional) The QoS profile to register the subscriber with. If not provided,
-            a "best effort" will be made to make the subscription work
+            uses fixed BEST_EFFORT + VOLATILE + KEEP_LAST depth 1 (see _get_default_qos_profile).
 
         :raises TopicNotEstablishedException: If no msg_type was specified by the caller and the
             topic is not yet established, so a topic type cannot be inferred
@@ -127,8 +128,6 @@ class MultiSubscriber(Generic[ROSMessageT]):
             raise TypeConflictException(topic, topic_type, msg_type_string)
 
         if qos is None:
-            # Fall back to default rosbridge QoS settings which try to provide a "best effort"
-            # compatibility with existing publishers on the topic.
             qos = self._get_default_qos_profile(node_handle, topic)
 
         # Create the subscriber and associated member variables
@@ -153,37 +152,20 @@ class MultiSubscriber(Generic[ROSMessageT]):
         self.new_subscriber: Subscription | None = None
         self.new_subscriptions: dict[str, Callable[[OutgoingMessage[ROSMessageT]], None]] = {}
 
-    def _get_default_qos_profile(self, node_handle: Node, topic: str) -> QoSProfile:
+    def _get_default_qos_profile(self, _node_handle: Node, _topic: str) -> QoSProfile:
         """
-        Infer a default QoS profile for best effort compatibility with existing publishers on the topic.
+        Default QoS when the rosbridge client omits qos on subscribe.
 
-        Certain combinations of publisher and subscriber QoS parameters are incompatible. Here we
-        make a "best effort" attempt to match existing publishers for the requested topic. This is
-        not perfect because more publishers may come online after our subscriber is set up, but we
-        try to provide sane defaults.
-        For this reason we use volatile durability and best effort reliability to prioritize topic
-        compatibility when the publisher policy is not known. For more information, see:
-        - https://docs.ros.org/en/rolling/Concepts/About-Quality-of-Service-Settings.html
-        - https://github.com/RobotWebTools/rosbridge_suite/issues/551
-        - https://github.com/RobotWebTools/rosbridge_suite/issues/769
+        ERC control station policy: always BEST_EFFORT, VOLATILE, KEEP_LAST, depth 1 for every
+        topic (no publisher introspection / no upgrade to transient_local or reliable).
+        Clients may still pass an explicit qos object in the subscribe message to override.
         """
-        qos = QoSProfile(
-            depth=1,
-            durability=DurabilityPolicy.VOLATILE,
+        return QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
         )
-
-        infos = node_handle.get_publishers_info_by_topic(topic)
-
-        if len(infos) > 0 and all(
-            pub.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL for pub in infos
-        ):
-            qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-            qos.reliability = ReliabilityPolicy.RELIABLE
-        if any(pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT for pub in infos):
-            qos.reliability = ReliabilityPolicy.BEST_EFFORT
-
-        return qos
 
     def _schedule_destroy_subscription(self, subscription: Subscription[ROSMessageT]) -> None:
         """
