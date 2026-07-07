@@ -165,3 +165,19 @@ class AdvertiseService(Capability):
         )
         self.protocol.external_service_list[service_name] = service_handler
         self.protocol.log("info", f"Advertised service {service_name}")
+
+    def finish(self) -> None:
+        """
+        Tear down every service this client advertised when its connection closes.
+
+        Without this, a client that disconnects without sending unadvertise_service (e.g. a
+        dropped websocket, browser refresh, or flaky link) leaves its create_service() handle
+        registered on the ROS graph forever. A subsequent reconnect then advertises a second
+        service server under the same name, and ROS has no guarantee the next request from an
+        external caller is routed to the live handler rather than the orphaned one waiting on a
+        Future that will never resolve — which looks like the service randomly hanging or
+        responding only after a long delay.
+        """
+        for service_name in list(self.protocol.external_service_list.keys()):
+            self.protocol.external_service_list[service_name].graceful_shutdown()
+            del self.protocol.external_service_list[service_name]
