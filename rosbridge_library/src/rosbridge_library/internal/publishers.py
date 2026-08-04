@@ -141,7 +141,7 @@ class MultiPublisher(Generic[ROSMessageT]):
         # Adding a lifespan solves the problem of late-joining subscribers
         # without the need of a custom message publisher implementation.
         publisher_qos = QoSProfile(
-            depth=queue_size if queue_size is not None else 100,
+            depth=queue_size if queue_size is not None else 1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
