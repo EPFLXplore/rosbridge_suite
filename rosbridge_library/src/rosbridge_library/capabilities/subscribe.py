@@ -306,6 +306,19 @@ class Subscribe(Capability):
                 client_id, topic, cb, self.protocol.node_handle
             )
 
+        # A subscribe that names `type` succeeds even when nothing publishes the topic, and then
+        # delivers nothing for as long as the client stays connected — indistinguishable from a
+        # feed whose messages are being dropped. Say so, so a typo in a topic name is not mistaken
+        # for a network problem.
+        if msg.get("type") is not None and topic not in dict(
+            self.protocol.node_handle.get_topic_names_and_types()
+        ):
+            self.protocol.log(
+                "warning",
+                f"Subscribing to {topic}, which no node currently publishes. No messages will "
+                "arrive until a publisher appears; check the topic name if this persists.",
+            )
+
         qos: QoSProfile | None = None
         if "qos" in msg:
             qos = extract_qos_profile(msg["qos"])

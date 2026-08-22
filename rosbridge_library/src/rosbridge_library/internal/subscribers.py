@@ -90,7 +90,8 @@ class MultiSubscriber(Generic[ROSMessageT]):
         :param msg_type: (optional) The type to register the subscriber as.  If not provided, an
             attempt will be made to infer the topic type
         :param qos: (optional) The QoS profile to register the subscriber with. If not provided,
-            uses fixed BEST_EFFORT + VOLATILE + KEEP_LAST depth 1 (see _get_default_qos_profile).
+            mirrors the publishers on the topic with KEEP_LAST depth 1 (see
+            _get_default_qos_profile).
 
         :raises TopicNotEstablishedException: If no msg_type was specified by the caller and the
             topic is not yet established, so a topic type cannot be inferred
@@ -152,20 +153,44 @@ class MultiSubscriber(Generic[ROSMessageT]):
         self.new_subscriber: Subscription | None = None
         self.new_subscriptions: dict[str, Callable[[OutgoingMessage[ROSMessageT]], None]] = {}
 
-    def _get_default_qos_profile(self, _node_handle: Node, _topic: str) -> QoSProfile:
+    def _get_default_qos_profile(self, node_handle: Node, topic: str) -> QoSProfile:
         """
         Default QoS when the rosbridge client omits qos on subscribe.
 
-        ERC control station policy: always BEST_EFFORT, VOLATILE, KEEP_LAST, depth 1 for every
-        topic (no publisher introspection / no upgrade to transient_local or reliable).
-        Clients may still pass an explicit qos object in the subscribe message to override.
+        Mirrors the publishers currently on the topic, with KEEP_LAST depth 1 so a slow websocket
+        sink cannot build a DDS-side backlog. Matching matters over a lossy link: a BEST_EFFORT
+        reader gets no retransmission, so a sample split across several UDP datagrams is lost
+        entirely if one of them is dropped, and a VOLATILE reader never receives the last value
+        held by a TRANSIENT_LOCAL publisher. `ros2 topic echo` does the same introspection, which
+        is why it can show a topic the control station reports as having no data.
+
+        Introspection runs once, when this MultiSubscriber is constructed (SubscriberManager keeps
+        one per topic for the lifetime of the process), so a publisher that appears after the
+        client subscribed is not matched; the client has to resubscribe to pick it up.
+
+        Clients may still pass an explicit qos object in the subscribe message to override this
+        (the camera feeds do, to stay BEST_EFFORT regardless of how the camera node publishes).
         """
-        return QoSProfile(
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
         )
+
+        infos = node_handle.get_publishers_info_by_topic(topic)
+        if not infos:
+            return qos
+
+        # Only upgrade when *every* publisher offers the stronger policy: a BEST_EFFORT writer
+        # does not match a RELIABLE reader at all, so a single one would silence the whole
+        # subscription. Same reasoning for VOLATILE vs TRANSIENT_LOCAL.
+        if all(pub.qos_profile.reliability == ReliabilityPolicy.RELIABLE for pub in infos):
+            qos.reliability = ReliabilityPolicy.RELIABLE
+        if all(pub.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL for pub in infos):
+            qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+
+        return qos
 
     def _schedule_destroy_subscription(self, subscription: Subscription[ROSMessageT]) -> None:
         """
