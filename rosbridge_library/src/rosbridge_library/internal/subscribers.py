@@ -60,6 +60,11 @@ if TYPE_CHECKING:
 is shared between multiple clients
 """
 
+# How often a default-QoS subscription re-checks the publishers on its topic. Only a graph query
+# unless the answer changed, so this is cheap; 5s is well inside the time it takes an operator to
+# notice a stack they just started is missing from the UI.
+QOS_RENEGOTIATE_PERIOD_S = 5.0
+
 
 class MultiSubscriber(Generic[ROSMessageT]):
     """
@@ -128,6 +133,9 @@ class MultiSubscriber(Generic[ROSMessageT]):
         if topic_type is not None and topic_type != msg_type_string:
             raise TypeConflictException(topic, topic_type, msg_type_string)
 
+        # An explicit profile is the client's choice and is never renegotiated below.
+        self.qos_is_explicit = qos is not None
+
         if qos is None:
             qos = self._get_default_qos_profile(node_handle, topic)
 
@@ -153,6 +161,14 @@ class MultiSubscriber(Generic[ROSMessageT]):
         self.new_subscriber: Subscription | None = None
         self.new_subscriptions: dict[str, Callable[[OutgoingMessage[ROSMessageT]], None]] = {}
 
+        self.qos_timer = None
+        if not self.qos_is_explicit:
+            self.qos_timer = node_handle.create_timer(
+                QOS_RENEGOTIATE_PERIOD_S,
+                self._renegotiate_qos,
+                callback_group=self.callback_group,
+            )
+
     def _get_default_qos_profile(self, node_handle: Node, topic: str) -> QoSProfile:
         """
         Default QoS when the rosbridge client omits qos on subscribe.
@@ -164,12 +180,14 @@ class MultiSubscriber(Generic[ROSMessageT]):
         held by a TRANSIENT_LOCAL publisher. `ros2 topic echo` does the same introspection, which
         is why it can show a topic the control station reports as having no data.
 
-        Introspection runs once, when this MultiSubscriber is constructed (SubscriberManager keeps
-        one per topic for the lifetime of the process), so a publisher that appears after the
-        client subscribed is not matched; the client has to resubscribe to pick it up.
+        A topic with no publisher yet cannot be introspected, so it starts on the weak fallback
+        below. `_renegotiate_qos` re-runs this once publishers show up and rebuilds the reader if
+        the answer changed, which is what lets a stack started after the browser connected be
+        picked up without the client resubscribing.
 
         Clients may still pass an explicit qos object in the subscribe message to override this
-        (the camera feeds do, to stay BEST_EFFORT regardless of how the camera node publishes).
+        (the camera feeds do, to stay BEST_EFFORT regardless of how the camera node publishes);
+        an explicit profile is never renegotiated.
         """
         qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -192,6 +210,73 @@ class MultiSubscriber(Generic[ROSMessageT]):
 
         return qos
 
+    def _renegotiate_qos(self) -> None:
+        """
+        Re-match the subscription QoS against the publishers currently on the topic.
+
+        The profile is chosen when the reader is created, which is wrong as soon as the graph
+        changes: a topic subscribed while its stack was down is pinned to the BEST_EFFORT/VOLATILE
+        fallback for the life of the process, and over a lossy link that means no retransmission
+        and lost samples long after the stack came back. Reloading the browser used to be the only
+        cure, because a fresh subscribe re-ran the introspection.
+
+        Two rules keep this from becoming the resubscribe churn it replaces:
+        - nothing publishing the topic means no information to act on, so leave the reader alone
+          rather than downgrading it, which is what makes a stopped stack completely quiet here;
+        - rebuild only when the desired profile actually differs, so the steady state costs one
+          graph query every QOS_RENEGOTIATE_PERIOD_S and nothing else.
+
+        Downgrades are applied as readily as upgrades. A reader left on RELIABLE after a node
+        restarts as BEST_EFFORT does not match the writer at all, so the goal is to equal the
+        desired profile, not to strengthen it.
+        """
+        infos = self.node_handle.get_publishers_info_by_topic(self.topic)
+        if not infos:
+            return
+
+        desired = self._get_default_qos_profile(self.node_handle, self.topic)
+
+        with self.rlock:
+            current = self.qos_profile
+            if (
+                desired.reliability == current.reliability
+                and desired.durability == current.durability
+            ):
+                return
+
+            self.node_handle.get_logger().info(
+                f"QoS for {self.topic} renegotiated: "
+                f"{current.reliability.name}/{current.durability.name} -> "
+                f"{desired.reliability.name}/{desired.durability.name}"
+            )
+
+            self.qos_profile = desired
+
+            old_subscriber = self.subscriber
+            self.subscriber = self.node_handle.create_subscription(
+                self.msg_class,
+                self.topic,
+                partial(self.callback, callbacks=None),
+                qos_profile=self.qos_profile,
+                raw=self.raw,
+                callback_group=self.callback_group,
+            )
+            self._schedule_destroy_subscription(old_subscriber)
+
+            # A new_subscriber is live only while a client is waiting for its first message; it
+            # has to move to the new profile too or that client keeps waiting on the old reader.
+            if self.new_subscriber is not None:
+                old_new_subscriber = self.new_subscriber
+                self.new_subscriber = self.node_handle.create_subscription(
+                    self.msg_class,
+                    self.topic,
+                    self._new_sub_callback,
+                    qos_profile=self.qos_profile,
+                    raw=self.raw,
+                    callback_group=self.callback_group,
+                )
+                self._schedule_destroy_subscription(old_new_subscriber)
+
     def _schedule_destroy_subscription(self, subscription: Subscription[ROSMessageT]) -> None:
         """
         Schedule subscription destruction on the executor thread.
@@ -209,6 +294,9 @@ class MultiSubscriber(Generic[ROSMessageT]):
             self.node_handle.destroy_subscription(subscription)
 
     def unregister(self) -> None:
+        if self.qos_timer is not None:
+            self.node_handle.destroy_timer(self.qos_timer)
+            self.qos_timer = None
         self._schedule_destroy_subscription(self.subscriber)
         with self.rlock:
             self.subscriptions.clear()
