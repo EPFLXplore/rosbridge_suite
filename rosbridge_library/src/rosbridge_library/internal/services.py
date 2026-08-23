@@ -264,9 +264,13 @@ def call_service(
 
     if not event.wait(timeout=(server_response_timeout if server_response_timeout > 0 else None)):
         future.cancel()
-        # A call that went unanswered says nothing good about this client, and keeping it cached
-        # would make every later call to the same service wait out the timeout too.
-        _discard_client(node_handle, service, client)
+        # The client is deliberately kept. A response timeout almost always means the server is
+        # slow, not that this client is broken -- /HD/ChangeModeSystem blocks for ~15s waiting out
+        # a motor lifecycle transition inside its own callback. Destroying the client here would
+        # make the next call pay endpoint discovery again, and would pull the endpoint out from
+        # under a reply that is still coming, which is what makes the server log
+        # "failed to send response (timeout)". A client that is genuinely dead is caught by the
+        # service_is_ready() check in _acquire_client on the next call.
         msg = "Timeout exceeded while waiting for service response"
         raise Exception(msg)
 
