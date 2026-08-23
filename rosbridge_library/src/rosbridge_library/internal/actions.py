@@ -32,7 +32,7 @@
 from __future__ import annotations
 
 import time
-from threading import Thread
+from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any, Generic, cast
 
 from rclpy.action import ActionClient
@@ -69,6 +69,88 @@ if TYPE_CHECKING:
 class InvalidActionException(Exception):
     def __init__(self, action_name: str) -> None:
         Exception.__init__(self, f"Action {action_name} does not exist")
+
+
+# Action clients are cached and reused across goals, for the same reason service clients are (see
+# internal/services.py). An ActionClient is five DDS endpoints -- three service clients plus the
+# feedback and status subscriptions -- so building one per goal means five endpoint discovery
+# round-trips before the goal is even sent, and wait_for_server() fails outright if they do not
+# all match within server_timeout_time.
+#
+# rclpy's ActionClient handles concurrent goals, so one per (action name, action type) is enough.
+# The cache is keyed by both: an action server restarted under a different type must not be
+# handed a client built for the old one.
+_CLIENT_CACHE_ATTR = "_rosbridge_action_clients"
+_client_cache_lock = Lock()
+
+
+def _client_cache(node_handle: Node) -> dict[tuple[str, str], ActionClient]:
+    """Return this node's {(action name, action type): client} cache."""
+    cache = getattr(node_handle, _CLIENT_CACHE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(node_handle, _CLIENT_CACHE_ATTR, cache)
+    return cache
+
+
+def _discard_client(node_handle: Node, key: tuple[str, str], client: ActionClient) -> None:
+    """Drop `client` from the cache and destroy it, unless another thread already replaced it."""
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        if cache.get(key) is client:
+            del cache[key]
+    client.destroy()
+
+
+def _acquire_client(
+    node_handle: Node, action_name: str, action_type: str, server_timeout_time: float
+) -> ActionClient:
+    """
+    Return an action client for `action_name`, reusing a cached one when possible.
+
+    :raises Exception: If no action server matched within server_timeout_time.
+    """
+    key = (action_name, action_type)
+
+    with _client_cache_lock:
+        cached = _client_cache(node_handle).get(key)
+
+    if cached is not None:
+        # Local rcl check, not a graph query, so this is cheap.
+        if cached.server_is_ready():
+            return cached
+        # Not ready is usually a blip. Give the existing client the same grace a fresh one would
+        # get before tearing it down -- other goals may still be in flight on it.
+        if cached.wait_for_server(timeout_sec=server_timeout_time):
+            return cached
+        _discard_client(node_handle, key, cached)
+
+    client = ActionClient(node_handle, get_action_class(action_type), action_name)
+    if not client.wait_for_server(timeout_sec=server_timeout_time):
+        client.destroy()
+        msg = "No action server available"
+        raise Exception(msg)
+
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        existing = cache.get(key)
+        if existing is not None:
+            # Another thread discovered the same server concurrently; keep its client.
+            client.destroy()
+            return existing
+        cache[key] = client
+
+    return client
+
+
+def dispose_action_clients(node_handle: Node) -> None:
+    """Destroy every cached action client for this node. Intended for shutdown and tests."""
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        clients = list(cache.values())
+        cache.clear()
+    for client in clients:
+        client.destroy()
 
 
 class ActionClientHandler(Thread, Generic[ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT]):
@@ -182,24 +264,21 @@ class SendGoal(Generic[ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT]):
     ) -> dict[str, Any]:
         # Given the action name and type, fetch a request instance
         action_name = expand_topic_name(action, node_handle.get_name(), node_handle.get_namespace())
-        action_class = get_action_class(action_type)
         inst = cast("ROSActionGoalT", get_action_goal_instance(action_type))
 
         # Populate the instance with the provided args
         args_to_action_goal_instance(inst, args)
 
         self.result = None
-        client = ActionClient(node_handle, action_class, action_name)
-        if not client.wait_for_server(timeout_sec=self.server_timeout_time):
-            msg = "No action server available"
-            raise Exception(msg)
+        client = _acquire_client(node_handle, action_name, action_type, self.server_timeout_time)
         send_goal_future = client.send_goal_async(inst, feedback_callback=feedback_cb)  # type: ignore[arg-type]
         send_goal_future.add_done_callback(self.goal_response_cb)
 
         while self.result is None:
             time.sleep(self.sleep_time)
 
-        client.destroy()
+        # The client is cached and shared with any other goal in flight on this action, so it is
+        # deliberately not destroyed here.
 
         if isinstance(self.result, Exception):
             raise self.result

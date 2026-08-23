@@ -31,7 +31,7 @@
 # POSSIBILITY OF SUCH DAMAGE.
 from __future__ import annotations
 
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any
 
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -57,6 +57,113 @@ if TYPE_CHECKING:
 class InvalidServiceException(Exception):
     def __init__(self, service_name: str) -> None:
         Exception.__init__(self, f"Service {service_name} does not exist")
+
+
+# Service clients are cached and reused across calls, keyed by resolved service name.
+#
+# Creating one per call is very expensive on a real robot network: it costs a
+# get_service_names_and_types() sweep of the whole graph (hundreds of entries once a navigation
+# stack is up, taken under the rcl graph lock) plus a full SEDP endpoint discovery round-trip in
+# wait_for_service(). That is paid on every operator button press, and when discovery does not
+# finish inside server_ready_timeout the call fails with InvalidServiceException even though the
+# server is perfectly healthy.
+#
+# The cache lives on the node rather than in a module global so its lifetime is exactly the
+# node's: a destroyed node takes its clients with it and cannot hand a stale client to a later
+# node that happens to reuse the same name (which is what tests do between cases).
+_CLIENT_CACHE_ATTR = "_rosbridge_service_clients"
+_client_cache_lock = Lock()
+
+
+def _client_cache(node_handle: Node) -> dict[str, tuple[str, Client]]:
+    """Return this node's {resolved service name: (service type, client)} cache."""
+    cache = getattr(node_handle, _CLIENT_CACHE_ATTR, None)
+    if cache is None:
+        cache = {}
+        setattr(node_handle, _CLIENT_CACHE_ATTR, cache)
+    return cache
+
+
+def _discard_client(node_handle: Node, service: str, client: Client) -> None:
+    """
+    Drop `client` from the cache and destroy it, so the next call rediscovers.
+
+    Only removes the entry if it is still the one passed in: another thread may already have
+    replaced it after noticing the same failure, and destroying that fresh client instead would
+    just move the problem to the next call.
+    """
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        if cache.get(service, (None, None))[1] is client:
+            del cache[service]
+    node_handle.destroy_client(client)
+
+
+def _acquire_client(
+    node_handle: Node, service: str, server_ready_timeout: float
+) -> tuple[str, Client]:
+    """
+    Return (service type, client) for an already-resolved service name.
+
+    :raises InvalidServiceException: If the service is not in the graph, or no server showed up
+        within server_ready_timeout.
+    """
+    with _client_cache_lock:
+        cached = _client_cache(node_handle).get(service)
+
+    if cached is not None:
+        # service_is_ready() is a local rcl check, not a graph query, so this is cheap.
+        if cached[1].service_is_ready():
+            return cached
+        # Not ready is usually a blip -- a brief dropout on the rover link, or a server still
+        # coming back up. Give the existing client the same grace a fresh one would get before
+        # tearing it down: another thread may be mid-call on it, and destroying it under them
+        # strands that call until its own timeout.
+        if cached[1].wait_for_service(server_ready_timeout):
+            return cached
+        _discard_client(node_handle, service, cached[1])
+
+    service_names_and_types = dict(node_handle.get_service_names_and_types())
+    service_types = service_names_and_types.get(service)
+    if service_types is None:
+        raise InvalidServiceException(service)
+
+    # service_type is a tuple of types at this point; only one type is supported.
+    if len(service_types) > 1:
+        node_handle.get_logger().warning(f"More than one service type detected: {service_types}")
+    service_type = service_types[0]
+
+    client: Client = node_handle.create_client(
+        get_service_class(service_type),  # type: ignore[misc]  # Silence type checker about not being able to infer type
+        service,
+        callback_group=ReentrantCallbackGroup(),
+    )
+
+    if not client.wait_for_service(server_ready_timeout):
+        node_handle.destroy_client(client)
+        raise InvalidServiceException(service)
+
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        existing = cache.get(service)
+        if existing is not None:
+            # Another thread discovered the same service concurrently. Keep its client so there
+            # is only ever one per service, and drop the duplicate we just built.
+            node_handle.destroy_client(client)
+            return existing
+        cache[service] = (service_type, client)
+
+    return service_type, client
+
+
+def dispose_service_clients(node_handle: Node) -> None:
+    """Destroy every cached service client for this node. Intended for shutdown and tests."""
+    with _client_cache_lock:
+        cache = _client_cache(node_handle)
+        clients = [client for _, client in cache.values()]
+        cache.clear()
+    for client in clients:
+        node_handle.destroy_client(client)
 
 
 class ServiceCaller(Thread):
@@ -138,30 +245,14 @@ def call_service(
     # Get the fully qualified service name with remappings applied
     service = node_handle.resolve_service_name(service)
 
-    # Given the service name, fetch the type and class of the service, and a request instance
-    service_names_and_types = dict(node_handle.get_service_names_and_types())
-    service_types = service_names_and_types.get(service)
-    if service_types is None:
-        raise InvalidServiceException(service)
+    # Given the service name, fetch the type and a client. Both come from the per-node cache, so
+    # a repeated call to the same service costs neither a graph sweep nor endpoint discovery.
+    service_type, client = _acquire_client(node_handle, service, server_ready_timeout)
 
-    # service_type is a tuple of types at this point; only one type is supported.
-    if len(service_types) > 1:
-        node_handle.get_logger().warning(f"More than one service type detected: {service_types}")
-    service_type = service_types[0]
-
-    service_class = get_service_class(service_type)
     inst = get_service_request_instance(service_type)
 
     # Populate the instance with the provided args
     args_to_service_request_instance(inst, args)
-
-    client: Client = node_handle.create_client(
-        service_class, service, callback_group=ReentrantCallbackGroup()
-    )
-
-    if not client.wait_for_service(server_ready_timeout):
-        node_handle.destroy_client(client)
-        raise InvalidServiceException(service)
 
     future = client.call_async(inst)
     event = Event()
@@ -173,11 +264,11 @@ def call_service(
 
     if not event.wait(timeout=(server_response_timeout if server_response_timeout > 0 else None)):
         future.cancel()
-        node_handle.destroy_client(client)
+        # A call that went unanswered says nothing good about this client, and keeping it cached
+        # would make every later call to the same service wait out the timeout too.
+        _discard_client(node_handle, service, client)
         msg = "Timeout exceeded while waiting for service response"
         raise Exception(msg)
-
-    node_handle.destroy_client(client)
 
     result = future.result()
 
@@ -186,6 +277,7 @@ def call_service(
         json_response = extract_values(result)
     else:
         exception = future.exception()
+        _discard_client(node_handle, service, client)
         raise Exception("Service call exception: " + str(exception))
 
     return json_response

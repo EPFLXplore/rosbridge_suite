@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, cast
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
 from tornado.httpserver import HTTPServer
@@ -257,7 +257,14 @@ async def async_main() -> None:
 
     node = RosbridgeWebsocketNode()
 
-    executor = SingleThreadedExecutor()
+    # MultiThreadedExecutor, not SingleThreadedExecutor: with one thread every topic callback,
+    # every outgoing JSON serialization, the QoS renegotiation timer, every service-client response
+    # future and the async advertised-service/action tasks are serialized behind each other, so a
+    # busy topic delays every service response and human-verification dialog. The callback groups
+    # are already laid out for this -- MultiSubscriber owns a MutuallyExclusiveCallbackGroup per
+    # topic (so per-topic ordering is preserved) while the service and action servers use
+    # ReentrantCallbackGroup, which does nothing at all until there is more than one thread.
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
 
     spin_thread = threading.Thread(target=executor.spin)

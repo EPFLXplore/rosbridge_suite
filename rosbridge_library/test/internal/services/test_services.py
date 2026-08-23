@@ -203,6 +203,55 @@ class TestServices(unittest.TestCase):
         for x, y in zip(result.names, json_ret["result"]["names"], strict=False):
             self.assertEqual(x, y)
 
+    def test_service_client_is_reused_across_calls(self) -> None:
+        """A repeated call to the same service reuses the cached client."""
+        self.node.declare_parameter("test_parameter", 1.0)
+        name = self.node.get_name() + "/list_parameters"
+        resolved = self.node.resolve_service_name(name)
+
+        services.call_service(self.node, name)
+        cache = services._client_cache(self.node)  # noqa: SLF001
+        self.assertIn(resolved, cache)
+        first_client = cache[resolved][1]
+
+        services.call_service(self.node, name)
+        self.assertIs(services._client_cache(self.node)[resolved][1], first_client)  # noqa: SLF001
+
+    def test_cached_call_skips_graph_lookup(self) -> None:
+        """
+        A cached call does not sweep the graph.
+
+        This is the whole point of the cache: get_service_names_and_types() marshals every
+        service in the graph under the rcl graph lock, and paying that on every operator button
+        press is what made services unusable on a busy robot network.
+        """
+        self.node.declare_parameter("test_parameter", 1.0)
+        name = self.node.get_name() + "/list_parameters"
+
+        services.call_service(self.node, name)
+
+        def fail_on_graph_sweep() -> None:
+            msg = "cached call swept the service graph"
+            raise AssertionError(msg)
+
+        self.node.get_service_names_and_types = fail_on_graph_sweep  # type: ignore[method-assign]
+        services.call_service(self.node, name)
+
+    def test_dispose_service_clients(self) -> None:
+        """dispose_service_clients empties the cache so the next call rediscovers."""
+        self.node.declare_parameter("test_parameter", 1.0)
+        name = self.node.get_name() + "/list_parameters"
+
+        services.call_service(self.node, name)
+        self.assertTrue(services._client_cache(self.node))  # noqa: SLF001
+
+        services.dispose_service_clients(self.node)
+        self.assertFalse(services._client_cache(self.node))  # noqa: SLF001
+
+        # Still works afterwards, on a freshly discovered client.
+        services.call_service(self.node, name)
+        self.assertTrue(services._client_cache(self.node))  # noqa: SLF001
+
     def test_service_caller(self) -> None:
         """Same as test_service_call but via the thread caller."""
         # Prepare parameter
