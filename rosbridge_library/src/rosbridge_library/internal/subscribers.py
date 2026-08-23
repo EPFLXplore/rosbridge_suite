@@ -60,13 +60,9 @@ if TYPE_CHECKING:
 is shared between multiple clients
 """
 
-# How often default-QoS subscriptions re-check the publishers on their topic. 5s is well inside
-# the time it takes an operator to notice a stack they just started is missing from the UI.
-#
-# One timer on the SubscriberManager drives every MultiSubscriber, rather than one timer each:
-# get_publishers_info_by_topic takes the rcl graph lock, and that is the same lock service calls
-# need to discover their server, so N independent timers turn into a steady drip of contention
-# against exactly the path an operator is waiting on.
+# How often a default-QoS subscription re-checks the publishers on its topic. Only a graph query
+# unless the answer changed, so this is cheap; 5s is well inside the time it takes an operator to
+# notice a stack they just started is missing from the UI.
 QOS_RENEGOTIATE_PERIOD_S = 5.0
 
 
@@ -165,9 +161,18 @@ class MultiSubscriber(Generic[ROSMessageT]):
         self.new_subscriber: Subscription | None = None
         self.new_subscriptions: dict[str, Callable[[OutgoingMessage[ROSMessageT]], None]] = {}
 
-        # Renegotiation is driven by SubscriberManager's single shared timer, which skips
-        # subscribers whose profile the client chose explicitly.
-        self.unregistered = False
+        self.qos_timer = None
+        if not self.qos_is_explicit:
+            # Deliberately this subscriber's own callback group, the same one that owns the
+            # subscription: renegotiation destroys and recreates that subscription, and a
+            # MutuallyExclusiveCallbackGroup is what guarantees the rebuild never overlaps a
+            # callback being delivered on the reader it is replacing. Driving this from a shared
+            # timer in another group loses that guarantee under a MultiThreadedExecutor.
+            self.qos_timer = node_handle.create_timer(
+                QOS_RENEGOTIATE_PERIOD_S,
+                self._renegotiate_qos,
+                callback_group=self.callback_group,
+            )
 
     def _get_default_qos_profile(self, node_handle: Node, topic: str) -> QoSProfile:
         """
@@ -181,7 +186,7 @@ class MultiSubscriber(Generic[ROSMessageT]):
         is why it can show a topic the control station reports as having no data.
 
         A topic with no publisher yet cannot be introspected, so it starts on the weak fallback
-        below. `renegotiate_qos` re-runs this once publishers show up and rebuilds the reader if
+        below. `_renegotiate_qos` re-runs this once publishers show up and rebuilds the reader if
         the answer changed, which is what lets a stack started after the browser connected be
         picked up without the client resubscribing.
 
@@ -210,7 +215,7 @@ class MultiSubscriber(Generic[ROSMessageT]):
 
         return qos
 
-    def renegotiate_qos(self) -> None:
+    def _renegotiate_qos(self) -> None:
         """
         Re-match the subscription QoS against the publishers currently on the topic.
 
@@ -230,9 +235,6 @@ class MultiSubscriber(Generic[ROSMessageT]):
         restarts as BEST_EFFORT does not match the writer at all, so the goal is to equal the
         desired profile, not to strengthen it.
         """
-        if self.qos_is_explicit or self.unregistered:
-            return
-
         infos = self.node_handle.get_publishers_info_by_topic(self.topic)
         if not infos:
             return
@@ -297,7 +299,9 @@ class MultiSubscriber(Generic[ROSMessageT]):
             self.node_handle.destroy_subscription(subscription)
 
     def unregister(self) -> None:
-        self.unregistered = True
+        if self.qos_timer is not None:
+            self.node_handle.destroy_timer(self.qos_timer)
+            self.qos_timer = None
         self._schedule_destroy_subscription(self.subscriber)
         with self.rlock:
             self.subscriptions.clear()
@@ -419,33 +423,6 @@ class SubscriberManager:
     def __init__(self) -> None:
         self._lock = Lock()
         self._subscribers: dict[str, MultiSubscriber] = {}
-        self._qos_timer = None
-        self._qos_timer_node: Node | None = None
-
-    def _ensure_qos_timer(self, node_handle: Node) -> None:
-        """
-        Start the shared QoS renegotiation timer on first use.
-
-        Created lazily rather than in __init__ because `manager` is a module-level singleton
-        built at import time, long before there is a node to hang a timer off. For the same
-        reason the owning node is tracked: the singleton outlives any individual node, so a
-        timer left over from a previous one has to be replaced rather than reused.
-        """
-        if self._qos_timer is not None and self._qos_timer_node is node_handle:
-            return
-
-        self._qos_timer = node_handle.create_timer(QOS_RENEGOTIATE_PERIOD_S, self._renegotiate_qos)
-        self._qos_timer_node = node_handle
-
-    def _renegotiate_qos(self) -> None:
-        """Re-match every default-QoS subscription against the publishers on its topic."""
-        with self._lock:
-            subscribers = list(self._subscribers.values())
-
-        # Deliberately outside the lock: renegotiating rebuilds subscriptions, and holding the
-        # manager lock across that would block every subscribe/unsubscribe for the duration.
-        for subscriber in subscribers:
-            subscriber.renegotiate_qos()
 
     def subscribe(
         self,
@@ -480,8 +457,6 @@ class SubscriberManager:
 
             if msg_type is not None and not raw:
                 self._subscribers[topic].verify_type(msg_type)
-
-            self._ensure_qos_timer(node_handle)
 
     def unsubscribe(self, client_id: str, topic: str) -> None:
         """

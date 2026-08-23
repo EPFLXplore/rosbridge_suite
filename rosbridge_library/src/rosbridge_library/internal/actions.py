@@ -36,6 +36,7 @@ from threading import Lock, Thread
 from typing import TYPE_CHECKING, Any, Generic, cast
 
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.expand_topic_name import expand_topic_name
 
 from rosbridge_library.internal.message_conversion import (
@@ -125,7 +126,17 @@ def _acquire_client(
             return cached
         _discard_client(node_handle, key, cached)
 
-    client = ActionClient(node_handle, get_action_class(action_type), action_name)
+    # ReentrantCallbackGroup, not the node default. ActionClient falls back to
+    # node.default_callback_group, which is MutuallyExclusive: that was tolerable when clients
+    # were built and destroyed per goal, but a cached client lives forever, so every cached
+    # action would end up sharing one group and only one of them could ever be serviced at a
+    # time -- goal responses, feedback and results all queueing behind each other.
+    client = ActionClient(
+        node_handle,
+        get_action_class(action_type),
+        action_name,
+        callback_group=ReentrantCallbackGroup(),
+    )
     if not client.wait_for_server(timeout_sec=server_timeout_time):
         client.destroy()
         msg = "No action server available"
