@@ -18,6 +18,9 @@ from rosbridge_library.internal.topics import (
 from rosbridge_library.util.ros import is_topic_subscribed
 from std_msgs.msg import String
 
+# Reduce this from its default of 10 to speed up tests
+manager.unregister_timeout = 1.0
+
 if TYPE_CHECKING:
     from rosbridge_library.internal.outgoing_message import OutgoingMessage
 
@@ -65,8 +68,41 @@ class TestSubscriberManager(unittest.TestCase):
         self.assert_topic_subscribed(topic)
 
         manager.unsubscribe(client, topic)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_not_subscribed(topic)
+
+    def test_resubscribe_within_timeout_reuses_reader(self) -> None:
+        """
+        A browser refresh must not cost a new DDS reader.
+
+        The last client leaving and a new one arriving moments later is exactly what a page
+        refresh looks like to rosbridge. Destroying the rclpy subscription in between means the
+        new client waits out a full endpoint discovery round trip with the publisher before it
+        sees anything, which shows up in the UI as NO DATA on every state topic after a refresh.
+        """
+        topic = "/test_resubscribe_within_timeout"
+        msg_type = "std_msgs/String"
+
+        manager.subscribe("old_connection", topic, lambda _: None, self.node, msg_type)
+        reader = manager._subscribers[topic].subscriber
+
+        manager.unsubscribe("old_connection", topic)
+        # Well inside unregister_timeout, as a refresh would be.
+        manager.subscribe("new_connection", topic, lambda _: None, self.node, msg_type)
+
+        self.assertNotIn(topic, manager.unregister_timers)
+        self.assertIs(manager._subscribers[topic].subscriber, reader)
+        self.assert_topic_subscribed(topic)
+
+        # The deferred teardown must not fire now that a client is back.
+        time.sleep(manager.unregister_timeout + 1.0)
+        self.assertIn(topic, manager._subscribers)
+        self.assert_topic_subscribed(topic)
+
+        manager.unsubscribe("new_connection", topic)
+        time.sleep(manager.unregister_timeout + 1.0)
+        self.assertNotIn(topic, manager._subscribers)
 
     def test_register_subscriber_multiclient(self) -> None:
         topic = "/test_register_subscriber_multiclient"
@@ -89,6 +125,7 @@ class TestSubscriberManager(unittest.TestCase):
         self.assert_topic_subscribed(topic)
 
         manager.unsubscribe(client2, topic)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_not_subscribed(topic)
 
@@ -138,12 +175,14 @@ class TestSubscriberManager(unittest.TestCase):
         self.assert_topic_subscribed(topic2)
 
         manager.unsubscribe(client, topic1)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic1 in manager._subscribers)
         self.assert_topic_not_subscribed(topic1)
         self.assertTrue(topic2 in manager._subscribers)
         self.assert_topic_subscribed(topic2)
 
         manager.unsubscribe(client, topic2)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic1 in manager._subscribers)
         self.assert_topic_not_subscribed(topic1)
         self.assertFalse(topic2 in manager._subscribers)
@@ -179,6 +218,7 @@ class TestSubscriberManager(unittest.TestCase):
         self.assert_topic_subscribed(topic)
 
         manager.unsubscribe(client, topic)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_subscribed(topic)
 
@@ -204,6 +244,7 @@ class TestSubscriberManager(unittest.TestCase):
         self.assert_topic_subscribed(topic)
 
         manager.unsubscribe(client2, topic)
+        time.sleep(manager.unregister_timeout + 1.0)
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_not_subscribed(topic)
 

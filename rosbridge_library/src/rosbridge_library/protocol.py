@@ -36,7 +36,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from rosbridge_library.capabilities.fragmentation import Fragmentation
-from rosbridge_library.internal import message_conversion, publishers
+from rosbridge_library.internal import message_conversion, publishers, subscribers
 from rosbridge_library.util import bson, json
 
 if TYPE_CHECKING:
@@ -135,6 +135,7 @@ class Protocol:
         # Configure internal modules
         message_conversion.configure(self.parameters)
         publishers.configure(self.parameters)
+        subscribers.configure(self.parameters)
 
         self.fragment_size = self.max_message_size
 

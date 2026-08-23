@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, cast
 
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.utilities import remove_ros_args
 from tornado.httpserver import HTTPServer
@@ -257,14 +257,15 @@ async def async_main() -> None:
 
     node = RosbridgeWebsocketNode()
 
-    # MultiThreadedExecutor, not SingleThreadedExecutor: with one thread every topic callback,
-    # every outgoing JSON serialization, the QoS renegotiation timer, every service-client response
-    # future and the async advertised-service/action tasks are serialized behind each other, so a
-    # busy topic delays every service response and human-verification dialog. The callback groups
-    # are already laid out for this -- MultiSubscriber owns a MutuallyExclusiveCallbackGroup per
-    # topic (so per-topic ordering is preserved) while the service and action servers use
-    # ReentrantCallbackGroup, which does nothing at all until there is more than one thread.
-    executor = MultiThreadedExecutor(num_threads=4)
+    # Deliberately single-threaded. A MultiThreadedExecutor was tried here to stop topic callbacks
+    # delaying service responses, and it is a much bigger change than it looks: subscription
+    # rebuilds, advertised-service and advertised-action resume tasks, and every client callback
+    # start running on separate threads, and rosbridge is not written or tested for that. The
+    # latency problem it was meant to solve turned out to be endpoint discovery on every call,
+    # which internal/services.py and internal/actions.py now fix by caching clients -- a change
+    # that stands on its own and needs only one thread. Do not reintroduce this without an
+    # end-to-end test covering advertised services and subscription QoS renegotiation.
+    executor = SingleThreadedExecutor()
     executor.add_node(node)
 
     spin_thread = threading.Thread(target=executor.spin)

@@ -34,8 +34,8 @@
 from __future__ import annotations
 
 from functools import partial
-from threading import Lock, RLock
-from typing import TYPE_CHECKING, Generic, cast
+from threading import Lock, RLock, Timer
+from typing import TYPE_CHECKING, Any, Generic, cast
 
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -423,6 +423,8 @@ class SubscriberManager:
     def __init__(self) -> None:
         self._lock = Lock()
         self._subscribers: dict[str, MultiSubscriber] = {}
+        self.unregister_timers: dict[str, Timer] = {}
+        self.unregister_timeout: float = 10.0
 
     def subscribe(
         self,
@@ -448,6 +450,11 @@ class SubscriberManager:
         :param qos: (optional) The QoSProfile of the topic
         """
         with self._lock:
+            # A pending teardown from the last client leaving is cancelled here, so a browser
+            # refresh reuses the live reader instead of paying for a new one.
+            if topic in self.unregister_timers:
+                self.unregister_timers.pop(topic).cancel()
+
             if topic not in self._subscribers:
                 self._subscribers[topic] = MultiSubscriber(
                     topic, client_id, callback, node_handle, msg_type=msg_type, raw=raw, qos=qos
@@ -462,6 +469,17 @@ class SubscriberManager:
         """
         Unsubscribe from a topic.
 
+        Tearing the reader down is deferred by unregister_timeout, the same way PublisherManager
+        defers unregistering a publisher.
+
+        Destroying the rclpy subscription the moment the last client leaves means the next
+        subscribe has to build a new DDS reader and wait out a full endpoint discovery round trip
+        with the publisher. On a browser refresh the last client always leaves, so every refresh
+        used to cost that round trip, and over a slow unicast link the operator sees NO DATA on
+        every state topic until discovery finishes. Nothing recovers it either: QoS renegotiation
+        only rebuilds the reader when the desired profile *differs*, and it returns early while no
+        publisher is visible. Lingering means a refresh reuses the reader that is already matched.
+
         :param client_id: The ID of the client to unsubscribe
         :param topic: The topic to unsubscribe from
         """
@@ -472,8 +490,30 @@ class SubscriberManager:
             self._subscribers[topic].unsubscribe(client_id)
 
             if not self._subscribers[topic].has_subscribers():
-                self._subscribers[topic].unregister()
+                if topic in self.unregister_timers:
+                    self.unregister_timers.pop(topic).cancel()
+                timer = Timer(self.unregister_timeout, self._unsubscribe_impl, [topic])
+                self.unregister_timers[topic] = timer
+                timer.start()
+
+    def _unsubscribe_impl(self, topic: str) -> None:
+        with self._lock:
+            self.unregister_timers.pop(topic, None)
+            subscriber = self._subscribers.get(topic)
+            # A client may have resubscribed between the timer firing and this lock being taken.
+            if subscriber is not None and not subscriber.has_subscribers():
+                subscriber.unregister()
                 del self._subscribers[topic]
+
+
+def configure(parameters: dict[str, Any] | None = None) -> None:
+    """
+    Configure the subscribers module.
+
+    :param parameters: A dictionary of parameters to configure the module.
+    """
+    if parameters is not None and "unregister_timeout" in parameters:
+        manager.unregister_timeout = float(parameters["unregister_timeout"])
 
 
 manager = SubscriberManager()
